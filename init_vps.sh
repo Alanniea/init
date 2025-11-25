@@ -16,64 +16,57 @@ function check_port() {
     fi
 }
 
-# =============== SSH 端口安全修改（含自动回滚） ==================
+# ================= SSH 安全修改（含本地 + 远程测试） =================
 function safe_modify_ssh_port() {
     local NEWPORT=$1
     local SSHCFG="/etc/ssh/sshd_config"
     local BACKUP="/etc/ssh/sshd_config.bak_$NEWPORT"
+    local REMOTE_IP=$(curl -s https://ipinfo.io/ip)
 
     echo "🔧 正在安全修改 SSH 端口为 $NEWPORT..."
-
-    # 备份
     sudo cp "$SSHCFG" "$BACKUP"
 
-    # 注释所有 Port 行
+    # 注释掉所有已有 Port
     sudo sed -i 's/^\s*Port\s\+/##Port /' "$SSHCFG"
 
-    # 写入新的端口
+    # 添加新端口
     echo "Port $NEWPORT" | sudo tee -a "$SSHCFG" >/dev/null
 
-    # 检查 SSH 配置是否正确
-    if ! sudo sshd -t; then
-        echo "❌ SSH 配置语法错误！"
-        sudo mv "$BACKUP" "$SSHCFG"
-        echo "✔ 已自动恢复原配置"
-        return 1
-    fi
-
-    # 重启 SSH
-    sudo systemctl restart ssh
-
-    sleep 1
-
-    # 检查本机是否在监听该端口
-    if ! ss -tln | grep -q ":$NEWPORT "; then
-        echo "❌ SSH 没有在监听端口 $NEWPORT"
-        sudo mv "$BACKUP" "$SSHCFG"
-        sudo systemctl restart ssh
-        echo "✔ 已自动回滚到旧端口"
-        return 1
-    fi
-
-    # 检查防火墙是否放行
+    # 防火墙放行新端口
     sudo ufw allow "$NEWPORT"/tcp >/dev/null
 
+    # 检查 SSH 配置语法
+    if ! sudo sshd -t; then
+        echo "❌ SSH 配置语法错误！回滚..."
+        sudo mv "$BACKUP" "$SSHCFG"
+        sudo systemctl restart ssh
+        return 1
+    fi
+
+    # 重启 SSH 服务
+    sudo systemctl restart ssh
     sleep 1
 
-    # 尝试连接新端口（本地测试）
-    if ! nc -z 127.0.0.1 "$NEWPORT" >/dev/null 2>&1; then
-        echo "❌ 无法连接到本地 SSH 新端口 $NEWPORT，可能会锁死"
+    # 本地监听检测
+    if ! sudo ss -tlnp | grep -E "(:$NEWPORT|:$NEWPORT\s)" >/dev/null; then
+        echo "❌ SSH 没有在本地监听端口 $NEWPORT"
+        sudo mv "$BACKUP" "$SSHCFG"
+        sudo systemctl restart ssh
+        return 1
+    fi
+
+    # 远程公网 IP 测试连接
+    echo "🌐 测试远程连接 $REMOTE_IP:$NEWPORT..."
+    if ! nc -z -w3 $REMOTE_IP $NEWPORT >/dev/null 2>&1; then
+        echo "❌ 无法通过公网 IP 连接 SSH，可能防火墙或安全组限制"
         sudo mv "$BACKUP" "$SSHCFG"
         sudo systemctl restart ssh
         echo "✔ 已自动回滚到旧端口"
         return 1
     fi
 
-    echo "🎉 SSH 新端口 $NEWPORT 测试成功！"
-    echo "✔ 安全启用该端口"
-
-    # 删除备份
     sudo rm -f "$BACKUP"
+    echo "✔ SSH 新端口 $NEWPORT 成功启用，本地 + 公网可连通"
     return 0
 }
 # ===============================================================
@@ -119,7 +112,6 @@ function init_vps() {
     sudo ufw --force enable
 
     echo "🔒 开始安全修改 SSH 端口..."
-
     if safe_modify_ssh_port "$SSH_PORT"; then
         echo "✔ SSH 端口已安全切换为 $SSH_PORT"
     else
@@ -132,6 +124,7 @@ function init_vps() {
     echo "🎉 VPS 初始化完成！"
     echo "用户名: $USERNAME"
     echo "随机密码: $RANDOM_PASS"
+    echo "请使用命令登录：ssh -p $SSH_PORT $USERNAME@你的VPS_IP"
 }
 
 # ==== 删除用户 ====
