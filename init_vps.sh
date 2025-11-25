@@ -1,29 +1,89 @@
 #!/usr/bin/env bash
 set -e
 
-# ==== 默认参数，可在初始化时修改 ====
+# ==== 默认参数 ====
 DEFAULT_USERNAME="aleta"
 DEFAULT_SSH_PORT=21357
 DEFAULT_LOCAL_SSH_KEY="$HOME/.ssh/id_rsa.pub"
-# ======================================
+# ==================
 
 function check_port() {
     local port=$1
     if sudo lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-        return 1   # 已被占用
+        return 1
     else
-        return 0   # 可用
+        return 0
     fi
 }
+
+# =============== SSH 端口安全修改（含自动回滚） ==================
+function safe_modify_ssh_port() {
+    local NEWPORT=$1
+    local SSHCFG="/etc/ssh/sshd_config"
+    local BACKUP="/etc/ssh/sshd_config.bak_$NEWPORT"
+
+    echo "🔧 正在安全修改 SSH 端口为 $NEWPORT..."
+
+    # 备份
+    sudo cp "$SSHCFG" "$BACKUP"
+
+    # 注释所有 Port 行
+    sudo sed -i 's/^\s*Port\s\+/##Port /' "$SSHCFG"
+
+    # 写入新的端口
+    echo "Port $NEWPORT" | sudo tee -a "$SSHCFG" >/dev/null
+
+    # 检查 SSH 配置是否正确
+    if ! sudo sshd -t; then
+        echo "❌ SSH 配置语法错误！"
+        sudo mv "$BACKUP" "$SSHCFG"
+        echo "✔ 已自动恢复原配置"
+        return 1
+    fi
+
+    # 重启 SSH
+    sudo systemctl restart ssh
+
+    sleep 1
+
+    # 检查本机是否在监听该端口
+    if ! ss -tln | grep -q ":$NEWPORT "; then
+        echo "❌ SSH 没有在监听端口 $NEWPORT"
+        sudo mv "$BACKUP" "$SSHCFG"
+        sudo systemctl restart ssh
+        echo "✔ 已自动回滚到旧端口"
+        return 1
+    fi
+
+    # 检查防火墙是否放行
+    sudo ufw allow "$NEWPORT"/tcp >/dev/null
+
+    sleep 1
+
+    # 尝试连接新端口（本地测试）
+    if ! nc -z 127.0.0.1 "$NEWPORT" >/dev/null 2>&1; then
+        echo "❌ 无法连接到本地 SSH 新端口 $NEWPORT，可能会锁死"
+        sudo mv "$BACKUP" "$SSHCFG"
+        sudo systemctl restart ssh
+        echo "✔ 已自动回滚到旧端口"
+        return 1
+    fi
+
+    echo "🎉 SSH 新端口 $NEWPORT 测试成功！"
+    echo "✔ 安全启用该端口"
+
+    # 删除备份
+    sudo rm -f "$BACKUP"
+    return 0
+}
+# ===============================================================
 
 function init_vps() {
     echo "🚀 VPS 初始化开始..."
 
-    # 输入用户名
     read -p "请输入新用户名 [默认: $DEFAULT_USERNAME]: " USERNAME
     USERNAME=${USERNAME:-$DEFAULT_USERNAME}
 
-    # 输入 SSH 端口并检测
     while true; do
         read -p "请输入 SSH 端口 [默认: $DEFAULT_SSH_PORT]: " SSH_PORT
         SSH_PORT=${SSH_PORT:-$DEFAULT_SSH_PORT}
@@ -31,93 +91,66 @@ function init_vps() {
             echo "✅ SSH 端口 $SSH_PORT 可用"
             break
         else
-            echo "❌ 端口 $SSH_PORT 已被占用，请输入其他端口"
+            echo "❌ 端口 $SSH_PORT 已被占用"
         fi
     done
 
-    # 输入本地 SSH 公钥路径
     read -p "请输入本地 SSH 公钥路径 [默认: $DEFAULT_LOCAL_SSH_KEY]: " LOCAL_SSH_KEY
     LOCAL_SSH_KEY=${LOCAL_SSH_KEY:-$DEFAULT_LOCAL_SSH_KEY}
 
-    # 更新系统
     sudo apt update && sudo apt upgrade -y
 
-    # 创建用户
     sudo adduser --disabled-password --gecos "" $USERNAME
     RANDOM_PASS=$(openssl rand -base64 12)
     echo "$USERNAME:$RANDOM_PASS" | sudo chpasswd
 
-    # 加入 sudo 并免密
     sudo usermod -aG sudo $USERNAME
     echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
 
-    # 配置 SSH Key
     sudo mkdir -p /home/$USERNAME/.ssh
     sudo cp "$LOCAL_SSH_KEY" /home/$USERNAME/.ssh/authorized_keys
     sudo chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh
     sudo chmod 700 /home/$USERNAME/.ssh
     sudo chmod 600 /home/$USERNAME/.ssh/authorized_keys
 
-    # 修改 SSH 端口（保留 root 登录，确保生效）
-    sudo sed -i 's/^\s*Port\s\+/##Port /' /etc/ssh/sshd_config
-    echo "Port $SSH_PORT" | sudo tee -a /etc/ssh/sshd_config
-
-    # 检查 SSH 配置是否正确
-    if ! sudo sshd -t; then
-        echo "❌ SSH 配置错误，端口修改失败"
-        exit 1
-    fi
-
-    # 重启 SSH 服务
-    sudo systemctl restart ssh
-    echo "✅ SSH 服务已重启，端口为 $SSH_PORT"
-
-    # 安装防火墙并启用
     sudo apt install -y ufw fail2ban
-    sudo ufw allow "$SSH_PORT"/tcp
     sudo ufw allow 80/tcp
     sudo ufw allow 443/tcp
     sudo ufw --force enable
 
-    # 启用 fail2ban
+    echo "🔒 开始安全修改 SSH 端口..."
+
+    if safe_modify_ssh_port "$SSH_PORT"; then
+        echo "✔ SSH 端口已安全切换为 $SSH_PORT"
+    else
+        echo "⚠ SSH 端口修改失败，已回滚，使用原端口继续"
+    fi
+
     sudo systemctl enable fail2ban
     sudo systemctl start fail2ban
 
-    echo "✅ VPS 初始化完成！"
+    echo "🎉 VPS 初始化完成！"
     echo "用户名: $USERNAME"
     echo "随机密码: $RANDOM_PASS"
-    echo "请使用命令登录：ssh -p $SSH_PORT $USERNAME@你的VPS_IP"
 }
 
+# ==== 删除用户 ====
 function delete_user() {
     read -p "请输入要删除的用户名 [默认: aleta]: " DEL_USER
     DEL_USER=${DEL_USER:-aleta}
 
-    if [ -z "$DEL_USER" ]; then
-        echo "用户名不能为空"
-        return
-    fi
-
-    # 默认确认 y
-    read -p "确认删除用户 $DEL_USER 及其所有配置和主目录？ [Y/n]: " confirm
+    read -p "确认删除用户 $DEL_USER 及其所有配置？ [Y/n]: " confirm
     if [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]]; then
-        # 删除 sudoers 配置
-        SUDOERS_FILE="/etc/sudoers.d/$DEL_USER"
-        if [ -f "$SUDOERS_FILE" ]; then
-            sudo rm -f "$SUDOERS_FILE"
-            echo "✅ 删除 sudoers 配置 $SUDOERS_FILE"
-        fi
-
-        # 删除用户及主目录
-        sudo userdel -rf "$DEL_USER" 2>/dev/null || true
-        sudo rm -rf "/home/$DEL_USER" 2>/dev/null || true
-
-        echo "✅ 用户 $DEL_USER 已完全删除"
+        sudo rm -f "/etc/sudoers.d/$DEL_USER"
+        sudo userdel -rf "$DEL_USER" || true
+        sudo rm -rf "/home/$DEL_USER"
+        echo "✔ 用户 $DEL_USER 已删除"
     else
-        echo "操作已取消"
+        echo "已取消"
     fi
 }
 
+# ==== 主菜单 ====
 function main_menu() {
     while true; do
         echo ""
@@ -129,11 +162,10 @@ function main_menu() {
         case $choice in
             1) init_vps ;;
             2) delete_user ;;
-            3) echo "退出脚本"; exit 0 ;;
-            *) echo "无效选项，请重新输入" ;;
+            3) exit 0 ;;
+            *) echo "无效选项" ;;
         esac
     done
 }
 
-# 运行主菜单
 main_menu
