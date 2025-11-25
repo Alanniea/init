@@ -16,6 +16,28 @@ function check_port() {
     fi
 }
 
+function modify_ssh_port() {
+    local port=$1
+    echo "🔧 修改 SSH 端口为 $port"
+
+    # 注释掉原有所有 Port 行
+    sudo sed -i 's/^\s*Port\s\+/##Port /g' /etc/ssh/sshd_config
+
+    # 添加新的端口
+    echo "Port $port" | sudo tee -a /etc/ssh/sshd_config
+
+    # 检查配置语法
+    sudo sshd -t
+    if [ $? -ne 0 ]; then
+        echo "❌ SSH 配置语法错误，请检查 /etc/ssh/sshd_config"
+        exit 1
+    fi
+
+    # 重启 SSH
+    sudo systemctl restart ssh
+    echo "✅ SSH 端口修改完成"
+}
+
 function init_vps() {
     echo "🚀 VPS 初始化开始..."
 
@@ -59,9 +81,7 @@ function init_vps() {
     sudo chmod 600 /home/$USERNAME/.ssh/authorized_keys
 
     # 修改 SSH 端口（保留 root 登录）
-    sudo sed -i 's/^Port /#Port /' /etc/ssh/sshd_config
-    echo "Port $SSH_PORT" | sudo tee -a /etc/ssh/sshd_config
-    sudo systemctl restart ssh
+    modify_ssh_port "$SSH_PORT"
 
     # 安装防火墙并启用
     sudo apt install -y ufw fail2ban
@@ -89,7 +109,7 @@ function delete_user() {
         return
     fi
 
-    # 默认确认为 y：直接回车或输入 y/Y 都将执行删除
+    # 默认确认 y
     read -p "确认删除用户 $DEL_USER 及其所有配置和主目录？ [Y/n]: " confirm
     if [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]]; then
         # 删除 sudoers 配置
