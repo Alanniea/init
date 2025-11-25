@@ -81,11 +81,14 @@ function init_vps() {
 }
 
 function delete_user() {
-    read -p "请输入要删除的用户名: " DEL_USER
+    read -p "请输入要删除的用户名 [默认: aleta]: " DEL_USER
+    DEL_USER=${DEL_USER:-aleta}
+
     if [ -z "$DEL_USER" ]; then
         echo "用户名不能为空"
         return
     fi
+
     read -p "确认删除用户 $DEL_USER 及其所有配置和主目录？[y/N]: " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         # 删除 sudoers 配置
@@ -98,6 +101,7 @@ function delete_user() {
         # 删除用户及主目录
         sudo userdel -rf "$DEL_USER" 2>/dev/null || true
         sudo rm -rf "/home/$DEL_USER" 2>/dev/null || true
+
         echo "✅ 用户 $DEL_USER 已完全删除"
     else
         echo "操作已取消"
@@ -113,19 +117,10 @@ function main_menu() {
         echo "3. 退出"
         read -p "请选择操作 [1-3]: " choice
         case $choice in
-            1)
-                init_vps
-                ;;
-            2)
-                delete_user
-                ;;
-            3)
-                echo "退出脚本"
-                exit 0
-                ;;
-            *)
-                echo "无效选项，请重新输入"
-                ;;
+            1) init_vps ;;
+            2) delete_user ;;
+            3) echo "退出脚本"; exit 0 ;;
+            *) echo "无效选项，请重新输入" ;;
         esac
     done
 }
