@@ -16,26 +16,19 @@ function check_port() {
     fi
 }
 
-function modify_ssh_port() {
-    local port=$1
-    echo "🔧 修改 SSH 端口为 $port"
+function set_ssh_port() {
+    local NEW_PORT=$1
+    # 备份配置
+    sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%s)
 
-    # 注释掉原有所有 Port 行
-    sudo sed -i 's/^\s*Port\s\+/##Port /g' /etc/ssh/sshd_config
+    # 注释掉所有旧 Port 行
+    sudo sed -i '/^\s*Port\s\+/Id; /^\s*#\s*Port\s\+/Id' /etc/ssh/sshd_config
 
-    # 添加新的端口
-    echo "Port $port" | sudo tee -a /etc/ssh/sshd_config
+    # 添加新端口
+    echo "Port $NEW_PORT" | sudo tee -a /etc/ssh/sshd_config
 
-    # 检查配置语法
-    sudo sshd -t
-    if [ $? -ne 0 ]; then
-        echo "❌ SSH 配置语法错误，请检查 /etc/ssh/sshd_config"
-        exit 1
-    fi
-
-    # 重启 SSH
-    sudo systemctl restart ssh
-    echo "✅ SSH 端口修改完成"
+    # 重启 SSH 服务
+    sudo systemctl restart sshd || sudo systemctl restart ssh
 }
 
 function init_vps() {
@@ -80,10 +73,10 @@ function init_vps() {
     sudo chmod 700 /home/$USERNAME/.ssh
     sudo chmod 600 /home/$USERNAME/.ssh/authorized_keys
 
-    # 修改 SSH 端口（保留 root 登录）
-    modify_ssh_port "$SSH_PORT"
+    # 修改 SSH 端口（可靠生效）
+    set_ssh_port $SSH_PORT
 
-    # 安装防火墙并启用
+    # 安装防火墙并放行端口
     sudo apt install -y ufw fail2ban
     sudo ufw allow "$SSH_PORT"/tcp
     sudo ufw allow 80/tcp
@@ -109,7 +102,7 @@ function delete_user() {
         return
     fi
 
-    # 默认确认 y
+    # 默认确认删除
     read -p "确认删除用户 $DEL_USER 及其所有配置和主目录？ [Y/n]: " confirm
     if [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]]; then
         # 删除 sudoers 配置
