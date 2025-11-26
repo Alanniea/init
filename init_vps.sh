@@ -16,67 +16,112 @@ function check_port() {
     fi
 }
 
+# 检测 SSH 服务名称
+function get_ssh_service_name() {
+    if systemctl list-unit-files | grep -q "^sshd.service"; then
+        echo "sshd"
+    elif systemctl list-unit-files | grep -q "^ssh.service"; then
+        echo "ssh"
+    else
+        echo "ssh"  # 默认
+    fi
+}
+
 # ================= SSH 安全修改（含本地 + 远程测试） =================
 function safe_modify_ssh_port() {
     local NEWPORT=$1
     local SSHCFG="/etc/ssh/sshd_config"
     local BACKUP="/etc/ssh/sshd_config.bak_$NEWPORT"
     local REMOTE_IP=$(curl -s https://ipinfo.io/ip)
+    local SSH_SERVICE=$(get_ssh_service_name)
 
     echo "🔧 正在安全修改 SSH 端口为 $NEWPORT..."
+    echo "📌 检测到 SSH 服务名称: $SSH_SERVICE"
+    
     sudo cp "$SSHCFG" "$BACKUP"
 
     # 注释掉所有已有 Port
     sudo sed -i 's/^\s*Port\s\+/##Port /' "$SSHCFG"
 
-    # 添加新端口
-    echo "Port $NEWPORT" | sudo tee -a "$SSHCFG" >/dev/null
+    # 添加新端口（在文件开头添加，确保优先级）
+    sudo sed -i "1iPort $NEWPORT" "$SSHCFG"
 
     # 防火墙放行新端口
     sudo ufw allow "$NEWPORT"/tcp >/dev/null
+    echo "✔ 防火墙已放行端口 $NEWPORT"
 
     # 检查 SSH 配置语法
-    if ! sudo sshd -t; then
+    echo "🔍 检查 SSH 配置语法..."
+    if ! sudo sshd -t 2>&1; then
         echo "❌ SSH 配置语法错误！回滚..."
         sudo mv "$BACKUP" "$SSHCFG"
-        sudo systemctl restart ssh
+        sudo systemctl restart "$SSH_SERVICE"
         return 1
     fi
+    echo "✔ SSH 配置语法正确"
 
     # 重启 SSH 服务
-    sudo systemctl restart ssh
+    echo "🔄 重启 SSH 服务 ($SSH_SERVICE)..."
+    sudo systemctl restart "$SSH_SERVICE"
     
-    # 等待 SSH 服务完全启动（最多等待 10 秒）
+    # 等待 SSH 服务完全启动（最多等待 15 秒）
     echo "⏳ 等待 SSH 服务启动..."
     local retry=0
-    local max_retries=10
+    local max_retries=15
     while [ $retry -lt $max_retries ]; do
         sleep 1
-        if sudo ss -tlnp | grep -E "(:$NEWPORT|:$NEWPORT\s)" >/dev/null; then
+        retry=$((retry + 1))
+        
+        # 检查服务是否运行
+        if ! sudo systemctl is-active --quiet "$SSH_SERVICE"; then
+            echo "⚠ SSH 服务未运行，尝试 $retry/$max_retries"
+            continue
+        fi
+        
+        # 检查端口监听
+        if sudo ss -tlnp | grep -E ":$NEWPORT\s" >/dev/null 2>&1; then
             echo "✔ SSH 已在本地监听端口 $NEWPORT"
             break
         fi
-        retry=$((retry + 1))
+        
         if [ $retry -eq $max_retries ]; then
             echo "❌ SSH 没有在本地监听端口 $NEWPORT（超时）"
+            echo "📋 当前监听的端口："
+            sudo ss -tlnp | grep ssh
+            echo "📋 SSH 服务状态："
+            sudo systemctl status "$SSH_SERVICE" --no-pager -l
+            echo "📋 最近的日志："
+            sudo journalctl -u "$SSH_SERVICE" -n 20 --no-pager
             sudo mv "$BACKUP" "$SSHCFG"
-            sudo systemctl restart ssh
+            sudo systemctl restart "$SSH_SERVICE"
             return 1
         fi
+        
+        echo "⏳ 等待中... ($retry/$max_retries)"
     done
 
     # 远程公网 IP 测试连接
-    echo "🌐 测试远程连接 $REMOTE_IP:$NEWPORT..."
-    if ! nc -z -w5 $REMOTE_IP $NEWPORT >/dev/null 2>&1; then
-        echo "❌ 无法通过公网 IP 连接 SSH，可能防火墙或安全组限制"
-        sudo mv "$BACKUP" "$SSHCFG"
-        sudo systemctl restart ssh
-        echo "✔ 已自动回滚到旧端口"
-        return 1
+    if [ -n "$REMOTE_IP" ]; then
+        echo "🌐 测试远程连接 $REMOTE_IP:$NEWPORT..."
+        if ! timeout 5 bash -c "echo >/dev/tcp/$REMOTE_IP/$NEWPORT" 2>/dev/null; then
+            echo "⚠ 无法通过公网 IP 连接 SSH，可能是："
+            echo "  - 云服务商安全组未开放端口 $NEWPORT"
+            echo "  - 网络防火墙限制"
+            echo "  - NAT 配置问题"
+            read -p "是否继续（本地测试已通过）？ [Y/n]: " confirm
+            if [[ ! -z "$confirm" && ! "$confirm" =~ ^[Yy]$ ]]; then
+                sudo mv "$BACKUP" "$SSHCFG"
+                sudo systemctl restart "$SSH_SERVICE"
+                echo "✔ 已自动回滚到旧端口"
+                return 1
+            fi
+        else
+            echo "✔ 远程连接测试成功"
+        fi
     fi
 
     sudo rm -f "$BACKUP"
-    echo "✔ SSH 新端口 $NEWPORT 成功启用，本地 + 公网可连通"
+    echo "✔ SSH 新端口 $NEWPORT 成功启用"
     return 0
 }
 # ===============================================================
