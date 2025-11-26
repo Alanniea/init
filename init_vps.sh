@@ -1,329 +1,180 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-# ==== 默认参数 ====
-DEFAULT_USERNAME="aleta"
-DEFAULT_SSH_PORT=21357
-DEFAULT_LOCAL_SSH_KEY="$HOME/.ssh/id_rsa.pub"
-# ==================
+# -----------------------
+# Ubuntu 一键初始化脚本
+# 功能：
+# - 创建用户 aleta（若不存在）
+# - 随机密码并显示/保存
+# - 将公钥 (~/.ssh/id_rsa.pub) 写入 /home/aleta/.ssh/authorized_keys（若不存在会要求你粘贴）
+# - 将 aleta 加入 sudo 并启用免密 sudo
+# - 修改 SSH 端口为 21357（备份原配置）
+# - 安装 fail2ban、ufw，放行 80/443 和 新 SSH 端口
+# - 交互式确认（关键操作）
+# -----------------------
 
-function check_port() {
-    local port=$1
-    if sudo lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-        return 1
-    else
-        return 0
-    fi
-}
+USER_NAME="aleta"
+SSH_PORT="21357"
+DEFAULT_PUBKEY_PATH="~/.ssh/id_rsa.pub"
+PASS_FILE="/root/${USER_NAME}-password.txt"
+SSHD_CONFIG="/etc/ssh/sshd_config"
+BACKUP_DIR="/root/init-backups-$(date +%Y%m%d%H%M%S)"
 
-# 检测 SSH 服务名称
-function get_ssh_service_name() {
-    if systemctl list-unit-files | grep -q "^sshd.service"; then
-        echo "sshd"
-    elif systemctl list-unit-files | grep -q "^ssh.service"; then
-        echo "ssh"
-    else
-        echo "ssh"
-    fi
-}
+echo "Ubuntu VPS 初始化脚本 — 将配置用户: ${USER_NAME}, SSH 端口: ${SSH_PORT}"
+echo
 
-# ================= SSH 安全修改（含本地 + 远程测试） =================
-function safe_modify_ssh_port() {
-    local NEWPORT=$1
-    local SSHCFG="/etc/ssh/sshd_config"
-    local BACKUP="/etc/ssh/sshd_config.bak_$NEWPORT"
-    local REMOTE_IP=$(curl -s https://ipinfo.io/ip)
-    local SSH_SERVICE=$(get_ssh_service_name)
+# require root
+if [[ $EUID -ne 0 ]]; then
+  echo "请以 root 身份运行此脚本（sudo）。"
+  exit 1
+fi
 
-    echo "====== 开始 SSH 端口修改 ======"
-    echo "🔧 目标端口: $NEWPORT"
-    echo "📌 SSH 服务: $SSH_SERVICE"
-    echo "🌐 公网 IP: $REMOTE_IP"
-    
-    # 检查并处理 socket activation
-    echo ""
-    echo "🔍 检查 socket activation 状态..."
-    
-    if systemctl list-unit-files | grep -q "${SSH_SERVICE}.socket"; then
-        echo "⚠️  检测到 ssh.socket 存在"
-        
-        # 完全停止并禁用 socket
-        echo "🛑 停止 ssh.socket..."
-        sudo systemctl stop ${SSH_SERVICE}.socket 2>/dev/null || true
-        
-        echo "🚫 禁用 ssh.socket..."
-        sudo systemctl disable ${SSH_SERVICE}.socket 2>/dev/null || true
-        
-        echo "🔒 屏蔽 ssh.socket..."
-        sudo systemctl mask ${SSH_SERVICE}.socket 2>/dev/null || true
-        
-        # 修改 socket 配置文件（防止重新启用）
-        for socket_file in /etc/systemd/system/ssh.socket /usr/lib/systemd/system/ssh.socket /lib/systemd/system/ssh.socket; do
-            if [ -f "$socket_file" ]; then
-                echo "📝 备份并修改 $socket_file"
-                sudo cp "$socket_file" "${socket_file}.bak" 2>/dev/null || true
-                # 注释掉 ListenStream 行
-                sudo sed -i 's/^ListenStream=/#ListenStream=/' "$socket_file" 2>/dev/null || true
-            fi
-        done
-        
-        # 重新加载 systemd
-        sudo systemctl daemon-reload
-        
-        echo "✔ 已禁用 socket activation"
-    fi
-    
-    # 确保 SSH 服务本身是启用的
-    echo ""
-    echo "🔧 确保 SSH 服务启用..."
-    sudo systemctl enable ${SSH_SERVICE}.service 2>/dev/null || true
-    
-    # 创建必需的目录
-    echo ""
-    echo "📁 创建 SSH 必需目录..."
-    sudo mkdir -p /run/sshd
-    sudo chmod 755 /run/sshd
-    echo "✔ 已创建 /run/sshd 目录"
-    
-    # 显示当前状态
-    echo ""
-    echo "📋 当前 SSH 配置中的端口："
-    sudo grep -E "^Port|^#Port" "$SSHCFG" || echo "未找到 Port 配置"
-    
-    # 备份配置
-    sudo cp "$SSHCFG" "$BACKUP"
-    echo "✔ 已备份配置到 $BACKUP"
+read -p "继续执行并修改系统配置吗？（y/N） " -r
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+  echo "已取消。"
+  exit 0
+fi
 
-    # 修改配置
-    echo ""
-    echo "🔧 修改 SSH 配置..."
-    
-    # 删除所有 Port 行
-    sudo sed -i '/^#*Port\s/d' "$SSHCFG"
-    
-    # 在文件开头添加新端口
-    sudo sed -i "1iPort $NEWPORT" "$SSHCFG"
-    
-    echo "✔ 已设置新端口 $NEWPORT"
-    
-    echo ""
-    echo "📋 修改后的配置："
-    sudo grep -E "^Port" "$SSHCFG"
+# create backup dir
+mkdir -p "${BACKUP_DIR}"
+echo "备份目录：${BACKUP_DIR}"
 
-    # 防火墙放行新端口
-    echo ""
-    echo "🔥 配置防火墙..."
-    sudo ufw allow "$NEWPORT"/tcp >/dev/null 2>&1
-    echo "✔ 防火墙已放行端口 $NEWPORT"
+# Generate random password (12 chars, reasonably strong)
+PASSWORD="$(openssl rand -base64 12 | tr -d '/+=' | cut -c1-16)"
+# Ensure a deterministic fallback
+if [[ -z "${PASSWORD:-}" ]]; then
+  PASSWORD="$(date +%s | sha256sum | base64 | head -c 16)"
+fi
 
-    # 检查 SSH 配置语法
-    echo ""
-    echo "🔍 检查 SSH 配置语法..."
-    if ! sudo sshd -t 2>&1; then
-        echo "❌ SSH 配置语法错误！"
-        sudo mv "$BACKUP" "$SSHCFG"
-        return 1
-    fi
-    echo "✔ SSH 配置语法正确"
+echo "准备创建用户 ${USER_NAME}（若已存在会尝试保留原配置并更新授权密钥与 sudo 权限）"
 
-    # 完全停止当前 SSH 相关服务
-    echo ""
-    echo "🛑 停止所有 SSH 相关服务..."
-    sudo systemctl stop ${SSH_SERVICE}.socket 2>/dev/null || true
-    sudo systemctl stop ${SSH_SERVICE}.service 2>/dev/null || true
-    sleep 2
-    
-    # 启动 SSH 服务（传统模式）
-    echo "🚀 启动 SSH 服务（传统模式）..."
-    sudo systemctl start ${SSH_SERVICE}.service
-    sleep 3
-    
-    # 检查服务状态
-    echo ""
-    echo "📋 SSH 服务状态："
-    sudo systemctl status ${SSH_SERVICE}.service --no-pager -l | head -20
-    
-    # 等待并检查端口监听
-    echo ""
-    echo "⏳ 等待 SSH 服务监听新端口..."
-    local retry=0
-    local max_retries=15
-    local found=0
-    
-    while [ $retry -lt $max_retries ]; do
-        retry=$((retry + 1))
-        sleep 1
-        
-        echo -n "."
-        
-        # 检查端口监听（多种方法）
-        if sudo ss -tlnp | grep -E ":$NEWPORT\s" | grep sshd >/dev/null 2>&1; then
-            found=1
-            break
-        fi
-        
-        if sudo lsof -iTCP:"$NEWPORT" -sTCP:LISTEN | grep sshd >/dev/null 2>&1; then
-            found=1
-            break
-        fi
-    done
-    
-    echo ""
-    
-    if [ $found -eq 0 ]; then
-        echo ""
-        echo "❌ SSH 服务未在端口 $NEWPORT 上监听"
-        echo ""
-        echo "📋 当前所有监听端口："
-        sudo ss -tlnp | grep -i ssh
-        echo ""
-        echo "📋 SSH 配置文件："
-        sudo cat "$SSHCFG" | head -20
-        echo ""
-        echo "📋 最近日志："
-        sudo journalctl -u ${SSH_SERVICE}.service -n 30 --no-pager
-        echo ""
-        echo "🔙 回滚配置..."
-        sudo mv "$BACKUP" "$SSHCFG"
-        sudo systemctl restart ${SSH_SERVICE}.service 2>/dev/null || true
-        sudo systemctl unmask ${SSH_SERVICE}.socket 2>/dev/null || true
-        sudo systemctl start ${SSH_SERVICE}.socket 2>/dev/null || true
-        echo "✔ 已回滚"
-        return 1
-    fi
-    
-    echo "✔ SSH 已在本地监听端口 $NEWPORT"
-    
-    echo ""
-    echo "📋 当前监听端口："
-    sudo ss -tlnp | grep sshd
+if id -u "${USER_NAME}" >/dev/null 2>&1; then
+  echo "用户 ${USER_NAME} 已存在，跳过创建步骤。"
+else
+  # create user with home and bash
+  useradd -m -s /bin/bash "${USER_NAME}"
+  echo "${USER_NAME} 创建完成。"
+fi
 
-    # 远程连接测试
-    if [ -n "$REMOTE_IP" ] && [ "$REMOTE_IP" != "127.0.0.1" ]; then
-        echo ""
-        echo "🌐 测试远程连接 $REMOTE_IP:$NEWPORT..."
-        if timeout 5 bash -c "echo >/dev/tcp/$REMOTE_IP/$NEWPORT" 2>/dev/null; then
-            echo "✔ 远程连接测试成功"
-        else
-            echo "⚠ 无法通过公网 IP 连接"
-            echo "请确保云服务商安全组已开放端口 $NEWPORT"
-            read -p "本地测试已通过，是否继续？ [Y/n]: " confirm
-            if [[ ! -z "$confirm" && ! "$confirm" =~ ^[Yy]$ ]]; then
-                sudo mv "$BACKUP" "$SSHCFG"
-                sudo systemctl restart ${SSH_SERVICE}.service 2>/dev/null || true
-                sudo systemctl unmask ${SSH_SERVICE}.socket 2>/dev/null || true
-                sudo systemctl start ${SSH_SERVICE}.socket 2>/dev/null || true
-                echo "✔ 已回滚"
-                return 1
-            fi
-        fi
-    fi
+# Set the password for the user
+echo "${USER_NAME}:${PASSWORD}" | chpasswd
+echo "已为 ${USER_NAME} 设置随机密码。"
 
-    sudo rm -f "$BACKUP"
-    echo ""
-    echo "✅ SSH 端口已成功修改为 $NEWPORT"
-    echo "====== SSH 端口修改完成 ======"
-    return 0
-}
-# ===============================================================
+# Save password to file (restricted)
+echo "用户名: ${USER_NAME}" > "${PASS_FILE}"
+echo "密码: ${PASSWORD}" >> "${PASS_FILE}"
+chmod 600 "${PASS_FILE}"
+echo "密码已保存到 ${PASS_FILE}（仅 root 可读）。"
 
-function init_vps() {
-    echo "🚀 VPS 初始化开始..."
+# Setup .ssh and authorized_keys
+read -p "公钥文件路径（默认：${DEFAULT_PUBKEY_PATH}）。如果服务器上不存在该文件，会提示你粘贴公钥。回车使用默认： " -r PUBKEY_INPUT
+PUBKEY_INPUT="${PUBKEY_INPUT:-${DEFAULT_PUBKEY_PATH}}"
+# expand ~ if present
+PUBKEY_PATH="$(eval echo "${PUBKEY_INPUT}")"
 
-    read -p "请输入新用户名 [默认: $DEFAULT_USERNAME]: " USERNAME
-    USERNAME=${USERNAME:-$DEFAULT_USERNAME}
+USER_SSH_DIR="/home/${USER_NAME}/.ssh"
+AUTH_KEYS="${USER_SSH_DIR}/authorized_keys"
 
-    while true; do
-        read -p "请输入 SSH 端口 [默认: $DEFAULT_SSH_PORT]: " SSH_PORT
-        SSH_PORT=${SSH_PORT:-$DEFAULT_SSH_PORT}
-        if check_port "$SSH_PORT"; then
-            echo "✅ SSH 端口 $SSH_PORT 可用"
-            break
-        else
-            echo "❌ 端口 $SSH_PORT 已被占用"
-        fi
-    done
+mkdir -p "${USER_SSH_DIR}"
+chmod 700 "${USER_SSH_DIR}"
 
-    read -p "请输入本地 SSH 公钥路径 [默认: $DEFAULT_LOCAL_SSH_KEY]: " LOCAL_SSH_KEY
-    LOCAL_SSH_KEY=${LOCAL_SSH_KEY:-$DEFAULT_LOCAL_SSH_KEY}
+if [[ -f "${PUBKEY_PATH}" ]]; then
+  echo "找到公钥文件：${PUBKEY_PATH}，将其写入 ${AUTH_KEYS}"
+  cat "${PUBKEY_PATH}" >> "${AUTH_KEYS}"
+else
+  echo "未在 ${PUBKEY_PATH} 找到公钥。请在下一行粘贴你的公钥（单行，开头通常为 ssh-rsa 或 ssh-ed25519），粘贴完成后按回车："
+  read -r PASTED_KEY
+  if [[ -z "${PASTED_KEY// /}" ]]; then
+    echo "未提供公钥，跳过写入 authorized_keys（此时请通过密码登录或手动上传公钥）。"
+  else
+    echo "${PASTED_KEY}" >> "${AUTH_KEYS}"
+  fi
+fi
 
-    sudo apt update && sudo apt upgrade -y
+chmod 600 "${AUTH_KEYS}" || true
+chown -R "${USER_NAME}:${USER_NAME}" "${USER_SSH_DIR}"
+echo "已配置 ${USER_NAME} 的 authorized_keys（若有）。"
 
-    sudo adduser --disabled-password --gecos "" $USERNAME
-    RANDOM_PASS=$(openssl rand -base64 12)
-    echo "$USERNAME:$RANDOM_PASS" | sudo chpasswd
+# Configure passwordless sudo for this user
+SUDO_FILE="/etc/sudoers.d/${USER_NAME}"
+echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > "${SUDO_FILE}"
+chmod 440 "${SUDO_FILE}"
+echo "已为 ${USER_NAME} 启用免密 sudo（文件：${SUDO_FILE}）。"
 
-    sudo usermod -aG sudo $USERNAME
-    echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME >/dev/null
+# Install packages: fail2ban, ufw, openssh-server (if missing)
+echo "更新 apt 并安装 fail2ban、ufw（可能需要一些时间）..."
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban ufw openssh-server
 
-    sudo mkdir -p /home/$USERNAME/.ssh
-    sudo cp "$LOCAL_SSH_KEY" /home/$USERNAME/.ssh/authorized_keys
-    sudo chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh
-    sudo chmod 700 /home/$USERNAME/.ssh
-    sudo chmod 600 /home/$USERNAME/.ssh/authorized_keys
+# Backup sshd_config before modifying
+mkdir -p "${BACKUP_DIR}/etc-ssh"
+cp -a "${SSHD_CONFIG}" "${BACKUP_DIR}/etc-ssh/sshd_config.bak"
+echo "已备份 ${SSHD_CONFIG} 到 ${BACKUP_DIR}/etc-ssh/sshd_config.bak"
 
-    sudo apt install -y ufw fail2ban
-    sudo ufw allow 80/tcp
-    sudo ufw allow 443/tcp
-    sudo ufw --force enable
+# Modify SSH port (and ensure PubkeyAuthentication on)
+# Use awk/sed to change or append settings
+# Port
+if grep -Eiq "^Port[[:space:]]+" "${SSHD_CONFIG}"; then
+  sed -ri "s/^(#?)[[:space:]]*Port[[:space:]]+.*/Port ${SSH_PORT}/I" "${SSHD_CONFIG}"
+else
+  echo "Port ${SSH_PORT}" >> "${SSHD_CONFIG}"
+fi
 
-    echo ""
-    echo "🔒 开始安全修改 SSH 端口..."
-    echo ""
-    if safe_modify_ssh_port "$SSH_PORT"; then
-        echo ""
-        echo "✔ SSH 端口已安全切换为 $SSH_PORT"
-    else
-        echo ""
-        echo "⚠ SSH 端口修改失败，已回滚，使用原端口继续"
-    fi
+# Ensure PubkeyAuthentication yes
+if grep -Eiq "^PubkeyAuthentication[[:space:]]+" "${SSHD_CONFIG}"; then
+  sed -ri "s/^(#?)[[:space:]]*PubkeyAuthentication[[:space:]]+.*/PubkeyAuthentication yes/I" "${SSHD_CONFIG}"
+else
+  echo "PubkeyAuthentication yes" >> "${SSHD_CONFIG}"
+fi
 
-    sudo systemctl enable fail2ban
-    sudo systemctl start fail2ban
+# Ensure AuthorizedKeysFile exists (default usually .ssh/authorized_keys)
+if ! grep -Eiq "^AuthorizedKeysFile[[:space:]]+" "${SSHD_CONFIG}"; then
+  echo "AuthorizedKeysFile %h/.ssh/authorized_keys" >> "${SSHD_CONFIG}"
+fi
 
-    echo ""
-    echo "🎉 VPS 初始化完成！"
-    echo "=============================="
-    echo "用户名: $USERNAME"
-    echo "随机密码: $RANDOM_PASS"
-    echo "SSH 端口: $SSH_PORT"
-    echo "=============================="
-    echo "请使用命令登录："
-    echo "ssh -p $SSH_PORT $USERNAME@你的VPS_IP"
-}
+# (可选) 不强制更改 PasswordAuthentication，这里保持系统默认以免锁住访问
+echo "SSHD 配置已更新：Port ${SSH_PORT}，启用公钥认证（已备份原配置）。"
 
-# ==== 删除用户 ====
-function delete_user() {
-    read -p "请输入要删除的用户名 [默认: aleta]: " DEL_USER
-    DEL_USER=${DEL_USER:-aleta}
+# Restart ssh service
+if systemctl restart ssh 2>/dev/null; then
+  echo "ssh 服务已重启（systemctl）。"
+else
+  service ssh restart || true
+  echo "尝试使用 init 脚本重启 ssh。"
+fi
 
-    read -p "确认删除用户 $DEL_USER 及其所有配置？ [Y/n]: " confirm
-    if [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]]; then
-        sudo rm -f "/etc/sudoers.d/$DEL_USER"
-        sudo userdel -rf "$DEL_USER" || true
-        sudo rm -rf "/home/$DEL_USER"
-        echo "✔ 用户 $DEL_USER 已删除"
-    else
-        echo "已取消"
-    fi
-}
+# Configure UFW: allow new SSH port, 80, 443
+echo "配置防火墙（ufw）：放行 ${SSH_PORT}, 80, 443。注意：启用 ufw 有可能影响当前连接。"
+read -p "确认现在允许并启用 ufw 吗？（y/N） " -r
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+  ufw allow "${SSH_PORT}"/tcp
+  ufw allow 80/tcp
+  ufw allow 443/tcp
+  ufw --force enable
+  echo "ufw 已启用并放行端口：${SSH_PORT},80,443。"
+else
+  echo "跳过启用 ufw。已为这些端口添加规则（若你手动启用 ufw 会生效）。"
+  ufw allow "${SSH_PORT}"/tcp || true
+  ufw allow 80/tcp || true
+  ufw allow 443/tcp || true
+fi
 
-# ==== 主菜单 ====
-function main_menu() {
-    while true; do
-        echo ""
-        echo "===== VPS 管理菜单 ====="
-        echo "1. 初始化 VPS"
-        echo "2. 删除用户"
-        echo "3. 退出"
-        read -p "请选择操作 [1-3]: " choice
-        case $choice in
-            1) init_vps ;;
-            2) delete_user ;;
-            3) exit 0 ;;
-            *) echo "无效选项" ;;
-        esac
-    done
-}
+# Basic fail2ban: ensure service running
+systemctl enable --now fail2ban || true
+echo "fail2ban 已启用并启动。"
 
-main_menu
+# Final summary
+echo
+echo "========================================"
+echo "初始化完成（部分操作可能需要几秒钟生效）。"
+echo "用户: ${USER_NAME}"
+echo "SSH 端口: ${SSH_PORT}"
+echo "随机密码已保存到: ${PASS_FILE}"
+echo
+echo "提示："
+echo "- 若你是通过 SSH 连接并且当前使用的是旧的 SSH 端口，请在本地打开一个新的终端先测试新端口是否可连通："
+echo "    ssh -p ${SSH_PORT} ${USER_NAME}@<your-server-ip>"
+echo "- 如果公钥未正确添加，你仍然可以使用随机密码登录（前提是 PasswordAuthentication 仍为 yes）。"
+echo "- sshd 原配置已备份到 ${BACKUP_DIR}"
+echo "- 若需要禁用 root 登录或禁止密码认证，请在确认公钥生效后手动修改 ${SSHD_CONFIG}（或告诉我我可帮你修改）"
+echo "========================================"
