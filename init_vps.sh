@@ -40,39 +40,40 @@ function safe_modify_ssh_port() {
     echo "📌 SSH 服务: $SSH_SERVICE"
     echo "🌐 公网 IP: $REMOTE_IP"
     
+    # 检查是否使用 socket activation
+    if systemctl is-enabled ${SSH_SERVICE}.socket >/dev/null 2>&1; then
+        echo ""
+        echo "⚠️  检测到系统使用 socket activation"
+        echo "🔧 禁用 socket activation，切换到传统模式..."
+        
+        # 停止并禁用 socket
+        sudo systemctl stop ${SSH_SERVICE}.socket 2>/dev/null || true
+        sudo systemctl disable ${SSH_SERVICE}.socket 2>/dev/null || true
+        sudo systemctl mask ${SSH_SERVICE}.socket 2>/dev/null || true
+        
+        echo "✔ 已禁用 socket activation"
+    fi
+    
     # 显示当前状态
     echo ""
     echo "📋 当前 SSH 配置中的端口："
     sudo grep -E "^Port|^#Port" "$SSHCFG" || echo "未找到 Port 配置"
     
-    echo ""
-    echo "📋 当前监听的 SSH 端口："
-    sudo ss -tlnp | grep -i ssh || echo "未找到 SSH 监听端口"
-    
     # 备份配置
     sudo cp "$SSHCFG" "$BACKUP"
     echo "✔ 已备份配置到 $BACKUP"
 
-    # 修改配置：完全替换 Port 行
+    # 修改配置
     echo ""
     echo "🔧 修改 SSH 配置..."
     
-    # 删除所有 Port 行（包括注释的）
+    # 删除所有 Port 行
     sudo sed -i '/^#*Port\s/d' "$SSHCFG"
     
-    # 在 Include 之后添加新端口（确保在主配置生效）
-    if grep -q "^Include" "$SSHCFG"; then
-        sudo sed -i "/^Include/a Port $NEWPORT" "$SSHCFG"
-    else
-        # 如果没有 Include，在文件开头添加
-        sudo sed -i "1iPort $NEWPORT" "$SSHCFG"
-    fi
+    # 在文件开头添加新端口
+    sudo sed -i "1iPort $NEWPORT" "$SSHCFG"
     
     echo "✔ 已设置新端口 $NEWPORT"
-    
-    echo ""
-    echo "📋 修改后的配置："
-    sudo grep -E "^Port" "$SSHCFG"
 
     # 防火墙放行新端口
     echo ""
@@ -85,23 +86,25 @@ function safe_modify_ssh_port() {
     echo "🔍 检查 SSH 配置语法..."
     if ! sudo sshd -t 2>&1; then
         echo "❌ SSH 配置语法错误！"
-        echo "回滚配置..."
         sudo mv "$BACKUP" "$SSHCFG"
-        sudo systemctl restart "$SSH_SERVICE"
+        sudo systemctl enable ${SSH_SERVICE}.socket 2>/dev/null || true
+        sudo systemctl unmask ${SSH_SERVICE}.socket 2>/dev/null || true
+        sudo systemctl start ${SSH_SERVICE}.socket 2>/dev/null || true
         return 1
     fi
     echo "✔ SSH 配置语法正确"
 
-    # 重启 SSH 服务
+    # 启用并启动 SSH 服务（传统模式）
     echo ""
-    echo "🔄 重启 SSH 服务 ($SSH_SERVICE)..."
-    sudo systemctl restart "$SSH_SERVICE"
-    sleep 2
+    echo "🔄 启动 SSH 服务（传统模式）..."
+    sudo systemctl enable ${SSH_SERVICE}.service
+    sudo systemctl restart ${SSH_SERVICE}.service
+    sleep 3
     
     # 检查服务状态
     echo ""
     echo "📋 SSH 服务状态："
-    sudo systemctl status "$SSH_SERVICE" --no-pager -l | head -15
+    sudo systemctl status ${SSH_SERVICE}.service --no-pager -l | head -15
     
     # 等待并检查端口监听
     echo ""
@@ -116,13 +119,8 @@ function safe_modify_ssh_port() {
         
         echo -n "."
         
-        # 检查端口监听（多种方法）
+        # 检查端口监听
         if sudo ss -tlnp | grep -E ":$NEWPORT\s" >/dev/null 2>&1; then
-            found=1
-            break
-        fi
-        
-        if sudo netstat -tlnp 2>/dev/null | grep -E ":$NEWPORT\s" >/dev/null 2>&1; then
             found=1
             break
         fi
@@ -137,29 +135,28 @@ function safe_modify_ssh_port() {
     
     if [ $found -eq 0 ]; then
         echo ""
-        echo "❌ SSH 服务未在端口 $NEWPORT 上监听（等待 ${retry} 秒后超时）"
+        echo "❌ SSH 服务未在端口 $NEWPORT 上监听"
         echo ""
-        echo "📋 当前所有 SSH 监听端口："
+        echo "📋 当前监听端口："
         sudo ss -tlnp | grep -i ssh
         echo ""
-        echo "📋 SSH 配置文件中的端口："
-        sudo grep -E "^Port" "$SSHCFG"
-        echo ""
-        echo "📋 最近的 SSH 日志："
-        sudo journalctl -u "$SSH_SERVICE" -n 20 --no-pager
+        echo "📋 最近日志："
+        sudo journalctl -u ${SSH_SERVICE}.service -n 20 --no-pager
         echo ""
         echo "🔙 回滚配置..."
         sudo mv "$BACKUP" "$SSHCFG"
-        sudo systemctl restart "$SSH_SERVICE"
-        sleep 2
-        echo "✔ 已回滚到原配置"
+        sudo systemctl enable ${SSH_SERVICE}.socket 2>/dev/null || true
+        sudo systemctl unmask ${SSH_SERVICE}.socket 2>/dev/null || true
+        sudo systemctl stop ${SSH_SERVICE}.service
+        sudo systemctl start ${SSH_SERVICE}.socket
+        echo "✔ 已回滚"
         return 1
     fi
     
     echo "✔ SSH 已在本地监听端口 $NEWPORT"
     
     echo ""
-    echo "📋 当前监听的端口："
+    echo "📋 当前监听端口："
     sudo ss -tlnp | grep -i ssh
 
     # 远程连接测试
@@ -169,12 +166,15 @@ function safe_modify_ssh_port() {
         if timeout 5 bash -c "echo >/dev/tcp/$REMOTE_IP/$NEWPORT" 2>/dev/null; then
             echo "✔ 远程连接测试成功"
         else
-            echo "⚠ 无法通过公网 IP 连接（可能原因：云服务商安全组未开放）"
+            echo "⚠ 无法通过公网 IP 连接（可能需要在云服务商安全组开放端口）"
             read -p "本地测试已通过，是否继续？ [Y/n]: " confirm
             if [[ ! -z "$confirm" && ! "$confirm" =~ ^[Yy]$ ]]; then
                 sudo mv "$BACKUP" "$SSHCFG"
-                sudo systemctl restart "$SSH_SERVICE"
-                echo "✔ 已回滚配置"
+                sudo systemctl enable ${SSH_SERVICE}.socket 2>/dev/null || true
+                sudo systemctl unmask ${SSH_SERVICE}.socket 2>/dev/null || true
+                sudo systemctl stop ${SSH_SERVICE}.service
+                sudo systemctl start ${SSH_SERVICE}.socket
+                echo "✔ 已回滚"
                 return 1
             fi
         fi
