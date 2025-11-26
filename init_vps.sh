@@ -78,6 +78,13 @@ function safe_modify_ssh_port() {
     echo "🔧 确保 SSH 服务启用..."
     sudo systemctl enable ${SSH_SERVICE}.service 2>/dev/null || true
     
+    # 创建必需的目录
+    echo ""
+    echo "📁 创建 SSH 必需目录..."
+    sudo mkdir -p /run/sshd
+    sudo chmod 755 /run/sshd
+    echo "✔ 已创建 /run/sshd 目录"
+    
     # 显示当前状态
     echo ""
     echo "📋 当前 SSH 配置中的端口："
