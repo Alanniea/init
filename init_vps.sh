@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ############################
-# VPS 一键初始化脚本（含“安全重启” ssh 逻辑）
+# VPS 一键初始化脚本
 # 功能：
 # - 创建用户（默认 aleta）
 # - 设置 SSH 端口（默认 21357）
@@ -11,13 +11,12 @@ set -euo pipefail
 # - 安装 fail2ban
 # - 使用 UFW 放行 80/443 和 SSH 端口
 # - 生成并显示随机密码
-# - 在修改 sshd_config 后进行语法校验，只有校验通过才重启；否则回滚备份
 ############################
 
 # --- helper
 info()  { echo -e "\\e[1;34m[INFO]\\e[0m $*"; }
 warn()  { echo -e "\\e[1;33m[WARN]\\e[0m $*"; }
-error() { echo -e "\\e[1;31m[ERROR]\\e[0m $*" ; exit 1; }
+error() { echo -e "\\e[1;31m[ERROR]\\e[0m $*"; exit 1; }
 
 # require root
 if [[ $EUID -ne 0 ]]; then
@@ -33,6 +32,7 @@ SSH_PORT="${INPUT_PORT:-21357}"
 echo
 info "将尝试从以下位置读取公钥（若存在）："
 CANDIDATE_KEYS=()
+# If script run with sudo, SUDO_USER points to original user
 orig_user="${SUDO_USER:-}"
 if [[ -n "$orig_user" ]]; then
   CANDIDATE_KEYS+=("/home/${orig_user}/.ssh/id_rsa.pub")
@@ -48,14 +48,17 @@ read -r -p "如果要从文件读取，输入文件路径并回车；直接回�
 
 PUBKEY=""
 if [[ -n "$KEY_INPUT" ]]; then
+  # if input looks like a path and file exists, read it; else treat as pasted key
   if [[ -f "$KEY_INPUT" ]]; then
     PUBKEY="$(<"$KEY_INPUT")"
   else
     info "检测为粘贴公钥；读取粘贴内容，结束请按 CTRL-D"
+    # read until EOF
     pasted="$(cat -)"
     PUBKEY="$pasted"
   fi
 else
+  # try candidate files in order
   for k in "${CANDIDATE_KEYS[@]}"; do
     if [[ -f "$k" ]]; then
       info "从 $k 读取公钥"
@@ -68,9 +71,11 @@ fi
 if [[ -z "${PUBKEY// /}" ]]; then
   warn "未检测到公钥内容 —— 将创建用户但不会安装 authorized_keys（你以后可手动添加公钥）。"
 else
-  PUBKEY="$(echo "$PUBKEY" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  # trim whitespace
+  PUBKEY="$(echo "$PUBKEY" | tr -d '\r\n' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
 fi
 
+# Confirm
 echo
 info "将创建用户: $USER_NAME"
 info "SSH 将改为端口: $SSH_PORT"
@@ -119,7 +124,7 @@ chmod 440 "/etc/sudoers.d/010-$USER_NAME"
 # --- apt update and install packages
 info "更新 apt 索引并安装 fail2ban 和 ufw"
 apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban ufw openssl
+DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban ufw
 
 # --- configure UFW: allow ports
 info "配置 UFW：允许 SSH($SSH_PORT), 80, 443"
@@ -142,8 +147,7 @@ BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
 info "备份 sshd 配置到 $BACKUP"
 cp -a "$SSHD_CONF" "$BACKUP"
 
-info "更新 $SSHD_CONF：设置 Port $SSH_PORT，确保允许公钥认证并根据是否提供公钥决定是否禁用密码认证"
-
+info "更新 $SSHD_CONF：设置 Port $SSH_PORT，确保允许公钥认证并禁用密码认证（强烈建议公钥已安装）"
 # helper to set or append settings
 set_or_replace() {
   local key="$1"; local val="$2"
@@ -156,69 +160,28 @@ set_or_replace() {
 
 set_or_replace Port "$SSH_PORT"
 set_or_replace PubkeyAuthentication "yes"
+# We'll disable password authentication to force key usage; if no key provided we keep it enabled
 if [[ -n "$PUBKEY" ]]; then
   set_or_replace PasswordAuthentication "no"
 else
   warn "没有提供公钥，保留 PasswordAuthentication（避免将你锁死）。"
+  # ensure PasswordAuthentication yes
   set_or_replace PasswordAuthentication "yes"
 fi
+# Ensure AuthorizedKeysFile has the default (for compatibility)
 set_or_replace AuthorizedKeysFile ".ssh/authorized_keys"
 
-# --- 安全重启逻辑：校验 -> 重启 -> 失败回滚
-SSHD_TEST_ERR="/tmp/sshd_test.err"
-SSHD_RESTART_ERR="/tmp/sshd_restart.err"
-
-# 清理旧的临时文件（非必须）
-: > "$SSHD_TEST_ERR" 2>/dev/null || true
-: > "$SSHD_RESTART_ERR" 2>/dev/null || true
-
-info "验证 sshd 配置语法..."
-if sshd -t 2>"$SSHD_TEST_ERR"; then
-  info "sshd_config 语法检查通过，尝试重启 ssh 服务..."
-  # 优先使用 systemctl reload-or-restart（如果可用），回退到 restart 或 service
-  if command -v systemctl >/dev/null 2>&1; then
-    # try reload-or-restart if available
-    if systemctl --version >/dev/null 2>&1 && systemctl reload-or-restart sshd.service 2>>"$SSHD_RESTART_ERR"; then
-      info "ssh 服务已通过 systemctl reload-or-restart sshd.service 成功重载/重启。"
-    else
-      # 有些系统没实现 reload-or-restart，尝试 restart
-      if systemctl restart sshd.service 2>>"$SSHD_RESTART_ERR" || systemctl restart ssh.service 2>>"$SSHD_RESTART_ERR"; then
-        info "ssh 服务已通过 systemctl restart 成功重启。"
-      else
-        warn "使用 systemctl 重启失败，尝试传统 service 命令..."
-        if service ssh restart 2>>"$SSHD_RESTART_ERR" || service sshd restart 2>>"$SSHD_RESTART_ERR" || /etc/init.d/ssh restart 2>>"$SSHD_RESTART_ERR"; then
-          info "ssh 服务通过 service 重启成功。"
-        else
-          error "重启 ssh 失败，请查看 $SSHD_RESTART_ERR 和 $SSHD_TEST_ERR 获取详情。"
-        fi
-      fi
-    fi
-  else
-    # 无 systemctl 的环境
-    if service ssh restart 2>>"$SSHD_RESTART_ERR" || service sshd restart 2>>"$SSHD_RESTART_ERR" || /etc/init.d/ssh restart 2>>"$SSHD_RESTART_ERR"; then
-      info "ssh 服务已重启（无 systemd 环境）。"
-    else
-      error "重启 ssh 失败（无 systemd），请检查 $SSHD_RESTART_ERR 和 $SSHD_TEST_ERR。"
-    fi
-  fi
+# Restart SSH
+info "重启 ssh 服务"
+if systemctl list-unit-files | grep -q sshd; then
+  systemctl restart sshd
 else
-  echo "========================================"
-  error "sshd_config 语法校验失败，重启已中止。错误已写入 $SSHD_TEST_ERR"
-  echo "将 $SSHD_CONF 还原到备份 $BACKUP"
-  cp -a "$BACKUP" "$SSHD_CONF"
-  # 尝试用旧配置再启动（以保证现有连接不被切断）
-  info "尝试使用备份配置重启 ssh（以保留当前会话）..."
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl restart sshd.service 2>>"$SSHD_RESTART_ERR" || systemctl restart ssh.service 2>>"$SSHD_RESTART_ERR" || true
-  else
-    service ssh restart 2>>"$SSHD_RESTART_ERR" || /etc/init.d/ssh restart 2>>"$SSHD_RESTART_ERR" || true
-  fi
-  error "已回滚配置并退出。请查看 $SSHD_TEST_ERR 和 $SSHD_RESTART_ERR 以诊断问题。"
+  systemctl restart ssh || true
 fi
 
-# --- ensure fail2ban enabled
+# --- fail2ban basic enable (use default jail.local if none exists)
 info "确保 fail2ban 正常启动"
-systemctl enable --now fail2ban >/dev/null 2>&1 || true
+systemctl enable --now fail2ban || true
 
 # --- summary
 echo
@@ -247,5 +210,4 @@ else
 fi
 echo
 warn "重要：如果你未提供公钥，请务必通过控制面板或控制台添加公钥以避免被锁定。"
-echo "如果遇到 ssh 无法连接，请使用托管商的控制台/串口登陆查看 $SSHD_TEST_ERR 和 $SSHD_RESTART_ERR。"
 echo "========================================"
