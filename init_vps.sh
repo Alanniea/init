@@ -2,15 +2,15 @@
 set -euo pipefail
 
 ############################
-# VPS 一键初始化脚本
-# 功能：
+# VPS 一键初始化脚本（含：创建用户 -> 禁用 root 远程登录）
 # - 创建用户（默认 aleta）
 # - 设置 SSH 端口（默认 21357）
 # - 安装并配置公钥登录（可从常见位置读取或粘贴）
 # - 启用免密 sudo
 # - 安装 fail2ban
 # - 使用 UFW 放行 80/443 和 SSH 端口
-# - 生成并显示随机密码
+# - 为新用户生成随机密码并显示
+# - 在创建完成后禁用 root 远程登录（PermitRootLogin no）
 ############################
 
 # --- helper
@@ -32,7 +32,6 @@ SSH_PORT="${INPUT_PORT:-21357}"
 echo
 info "将尝试从以下位置读取公钥（若存在）："
 CANDIDATE_KEYS=()
-# If script run with sudo, SUDO_USER points to original user
 orig_user="${SUDO_USER:-}"
 if [[ -n "$orig_user" ]]; then
   CANDIDATE_KEYS+=("/home/${orig_user}/.ssh/id_rsa.pub")
@@ -48,17 +47,14 @@ read -r -p "如果要从文件读取，输入文件路径并回车；直接回�
 
 PUBKEY=""
 if [[ -n "$KEY_INPUT" ]]; then
-  # if input looks like a path and file exists, read it; else treat as pasted key
   if [[ -f "$KEY_INPUT" ]]; then
     PUBKEY="$(<"$KEY_INPUT")"
   else
     info "检测为粘贴公钥；读取粘贴内容，结束请按 CTRL-D"
-    # read until EOF
     pasted="$(cat -)"
     PUBKEY="$pasted"
   fi
 else
-  # try candidate files in order
   for k in "${CANDIDATE_KEYS[@]}"; do
     if [[ -f "$k" ]]; then
       info "从 $k 读取公钥"
@@ -71,7 +67,6 @@ fi
 if [[ -z "${PUBKEY// /}" ]]; then
   warn "未检测到公钥内容 —— 将创建用户但不会安装 authorized_keys（你以后可手动添加公钥）。"
 else
-  # trim whitespace
   PUBKEY="$(echo "$PUBKEY" | tr -d '\r\n' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
 fi
 
@@ -147,8 +142,7 @@ BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
 info "备份 sshd 配置到 $BACKUP"
 cp -a "$SSHD_CONF" "$BACKUP"
 
-info "更新 $SSHD_CONF：设置 Port $SSH_PORT，确保允许公钥认证并禁用密码认证（强烈建议公钥已安装）"
-# helper to set or append settings
+info "更新 $SSHD_CONF：设置 Port $SSH_PORT，确保允许公钥认证并根据情况设置密码认证"
 set_or_replace() {
   local key="$1"; local val="$2"
   if grep -qiE "^\\s*#?\\s*${key}\\b" "$SSHD_CONF"; then
@@ -160,28 +154,39 @@ set_or_replace() {
 
 set_or_replace Port "$SSH_PORT"
 set_or_replace PubkeyAuthentication "yes"
-# We'll disable password authentication to force key usage; if no key provided we keep it enabled
 if [[ -n "$PUBKEY" ]]; then
   set_or_replace PasswordAuthentication "no"
 else
   warn "没有提供公钥，保留 PasswordAuthentication（避免将你锁死）。"
-  # ensure PasswordAuthentication yes
   set_or_replace PasswordAuthentication "yes"
 fi
-# Ensure AuthorizedKeysFile has the default (for compatibility)
 set_or_replace AuthorizedKeysFile ".ssh/authorized_keys"
 
-# Restart SSH
-info "重启 ssh 服务"
-if systemctl list-unit-files | grep -q sshd; then
+# Restart SSH to apply SSH port / auth changes now (before disabling root)
+info "重启 ssh 服务（应用端口与认证更改）"
+if systemctl list-unit-files | grep -qi sshd; then
   systemctl restart sshd
 else
   systemctl restart ssh || true
 fi
 
-# --- fail2ban basic enable (use default jail.local if none exists)
+# --- ensure fail2ban running
 info "确保 fail2ban 正常启动"
 systemctl enable --now fail2ban || true
+
+# --- Now disable root remote login (PermitRootLogin no)
+# We do this AFTER the new user/password/key is in place to avoid锁死 root
+info "将在确认新用户已创建后禁用 root 远程登录 (PermitRootLogin no)"
+set_or_replace PermitRootLogin "no"
+
+# Backup again (optional) and restart ssh to apply PermitRootLogin change
+cp -a "$SSHD_CONF" "${SSHD_CONF}.postuser.bak.$(date +%Y%m%d%H%M%S)" || true
+info "重启 ssh 服务（应用 PermitRootLogin=no）"
+if systemctl list-unit-files | grep -qi sshd; then
+  systemctl restart sshd
+else
+  systemctl restart ssh || true
+fi
 
 # --- summary
 echo
@@ -196,6 +201,7 @@ else
 fi
 echo "  fail2ban:    已安装并尝试启用"
 echo "  防火墙 (UFW): 已启用并放行 80, 443 和 $SSH_PORT"
+echo "  root 远程登录: 已禁用 (PermitRootLogin no)"
 echo
 echo "  ${USER_NAME} 的随机密码（请保存）："
 echo
@@ -209,5 +215,5 @@ else
   echo "请使用你的 VPS IP（或域名）连接： ssh -i ~/.ssh/id_rsa -p ${SSH_PORT} ${USER_NAME}@<your-server-ip>"
 fi
 echo
-warn "重要：如果你未提供公钥，请务必通过控制面板或控制台添加公钥以避免被锁定。"
+warn "重要：已禁用 root 远程登录。确保你能以新用户登录（公钥或上面显示的密码），否则可能无法远程访问。若需恢复 root 登录，可在控制台修改 /etc/ssh/sshd_config 中 PermitRootLogin 的值并重启 ssh。"
 echo "========================================"
