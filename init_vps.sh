@@ -16,77 +16,73 @@ function check_port() {
     fi
 }
 
-# ============== 安全修改 SSH 端口（通过 99-custom-port.conf，含本地+公网检测） ==============
+# ================= SSH 安全修改（含本地 + 远程测试） =================
 function safe_modify_ssh_port() {
     local NEWPORT=$1
-    local CUSTOM="/etc/ssh/sshd_config.d/99-custom-port.conf"
-    local BACKUP="${CUSTOM}.bak"
-    local REMOTE_IP=""
-    # 尝试获取公网 IP（网络不可用时不影响本地检测）
-    if command -v curl >/dev/null 2>&1; then
-        REMOTE_IP=$(curl -s https://ipinfo.io/ip 2>/dev/null || echo "")
-    fi
+    local SSHCFG="/etc/ssh/sshd_config"
+    local BACKUP="/etc/ssh/sshd_config.bak_$NEWPORT"
+    local REMOTE_IP=$(curl -s https://ipinfo.io/ip)
 
-    echo "🔧 使用 $CUSTOM 设置 SSH 端口为 $NEWPORT（优先级最高）..."
+    echo "🔧 正在安全修改 SSH 端口为 $NEWPORT..."
+    sudo cp "$SSHCFG" "$BACKUP"
 
-    # 安装必要工具（nc 用于测试）
-    if ! command -v nc >/dev/null 2>&1; then
-        sudo apt-get update -y >/dev/null 2>&1 || true
-        sudo apt-get install -y netcat-openbsd >/dev/null 2>&1 || true
-    fi
+    # 注释掉所有已有 Port
+    sudo sed -i 's/^\s*Port\s\+/##Port /' "$SSHCFG"
 
-    # 备份已有自定义文件（如果有）
-    if [ -f "$CUSTOM" ]; then
-        sudo cp "$CUSTOM" "$BACKUP"
-    fi
+    # 添加新端口
+    echo "Port $NEWPORT" | sudo tee -a "$SSHCFG" >/dev/null
 
-    # 写入/覆盖自定义 conf（确保优先级高于 cloud-init）
-    echo "Port $NEWPORT" | sudo tee "$CUSTOM" >/dev/null
-    sudo chmod 644 "$CUSTOM"
+    # 防火墙放行新端口
+    sudo ufw allow "$NEWPORT"/tcp >/dev/null
 
-    # 优先放行防火墙新端口（避免被 ufw 拦截）
-    sudo ufw allow "$NEWPORT"/tcp >/dev/null 2>&1 || true
-
-    # 语法检查
+    # 检查 SSH 配置语法
     if ! sudo sshd -t; then
-        echo "❌ sshd 配置语法错误，恢复自定义文件并退出"
-        if [ -f "$BACKUP" ]; then sudo mv "$BACKUP" "$CUSTOM"; else sudo rm -f "$CUSTOM"; fi
+        echo "❌ SSH 配置语法错误！回滚..."
+        sudo mv "$BACKUP" "$SSHCFG"
         sudo systemctl restart ssh
         return 1
     fi
 
-    # 重启 ssh 并短等
+    # 重启 SSH 服务
     sudo systemctl restart ssh
-    sleep 1
-
-    # 检测监听（兼容 IPv4/IPv6）
-    if ! sudo ss -tlnp | grep -E "(:$NEWPORT\b|:$NEWPORT\s)" >/dev/null; then
-        echo "❌ sshd 未监听端口 $NEWPORT，恢复自定义文件并退出"
-        if [ -f "$BACKUP" ]; then sudo mv "$BACKUP" "$CUSTOM"; else sudo rm -f "$CUSTOM"; fi
-        sudo systemctl restart ssh
-        return 1
-    fi
-
-    # 如果能拿到公网 IP，则测试公网连通性；若失败则回滚
-    if [ -n "$REMOTE_IP" ]; then
-        echo "🌐 测试公网连接 $REMOTE_IP:$NEWPORT ..."
-        if ! nc -z -w3 "$REMOTE_IP" "$NEWPORT" >/dev/null 2>&1; then
-            echo "❌ 公网连接测试失败，恢复自定义文件并退出"
-            if [ -f "$BACKUP" ]; then sudo mv "$BACKUP" "$CUSTOM"; else sudo rm -f "$CUSTOM"; fi
+    
+    # 等待 SSH 服务完全启动（最多等待 10 秒）
+    echo "⏳ 等待 SSH 服务启动..."
+    local retry=0
+    local max_retries=10
+    while [ $retry -lt $max_retries ]; do
+        sleep 1
+        if sudo ss -tlnp | grep -E "(:$NEWPORT|:$NEWPORT\s)" >/dev/null; then
+            echo "✔ SSH 已在本地监听端口 $NEWPORT"
+            break
+        fi
+        retry=$((retry + 1))
+        if [ $retry -eq $max_retries ]; then
+            echo "❌ SSH 没有在本地监听端口 $NEWPORT（超时）"
+            sudo mv "$BACKUP" "$SSHCFG"
             sudo systemctl restart ssh
             return 1
         fi
+    done
+
+    # 远程公网 IP 测试连接
+    echo "🌐 测试远程连接 $REMOTE_IP:$NEWPORT..."
+    if ! nc -z -w5 $REMOTE_IP $NEWPORT >/dev/null 2>&1; then
+        echo "❌ 无法通过公网 IP 连接 SSH，可能防火墙或安全组限制"
+        sudo mv "$BACKUP" "$SSHCFG"
+        sudo systemctl restart ssh
+        echo "✔ 已自动回滚到旧端口"
+        return 1
     fi
 
-    # 成功：删除备份（如有）
-    sudo rm -f "$BACKUP" 2>/dev/null || true
-    echo "✔ SSH 端口 $NEWPORT 已成功启用（通过 $CUSTOM）"
+    sudo rm -f "$BACKUP"
+    echo "✔ SSH 新端口 $NEWPORT 成功启用，本地 + 公网可连通"
     return 0
 }
-# =======================================================================================
+# ===============================================================
 
 function init_vps() {
-    echo "🚀 开始 VPS 初始化..."
+    echo "🚀 VPS 初始化开始..."
 
     read -p "请输入新用户名 [默认: $DEFAULT_USERNAME]: " USERNAME
     USERNAME=${USERNAME:-$DEFAULT_USERNAME}
@@ -95,10 +91,10 @@ function init_vps() {
         read -p "请输入 SSH 端口 [默认: $DEFAULT_SSH_PORT]: " SSH_PORT
         SSH_PORT=${SSH_PORT:-$DEFAULT_SSH_PORT}
         if check_port "$SSH_PORT"; then
-            echo "✅ 端口 $SSH_PORT 可用"
+            echo "✅ SSH 端口 $SSH_PORT 可用"
             break
         else
-            echo "❌ 端口 $SSH_PORT 已被占用，请换一个"
+            echo "❌ 端口 $SSH_PORT 已被占用"
         fi
     done
 
@@ -127,25 +123,26 @@ function init_vps() {
 
     echo "🔒 开始安全修改 SSH 端口..."
     if safe_modify_ssh_port "$SSH_PORT"; then
-        echo "✔ SSH 端口已切换为 $SSH_PORT"
+        echo "✔ SSH 端口已安全切换为 $SSH_PORT"
     else
-        echo "⚠ SSH 端口修改失败，已回滚为原端口"
+        echo "⚠ SSH 端口修改失败，已回滚，使用原端口继续"
     fi
 
     sudo systemctl enable fail2ban
     sudo systemctl start fail2ban
 
-    echo "🎉 初始化完成"
+    echo "🎉 VPS 初始化完成！"
     echo "用户名: $USERNAME"
     echo "随机密码: $RANDOM_PASS"
-    echo "登录命令: ssh -p $SSH_PORT $USERNAME@你的VPS_IP"
+    echo "请使用命令登录：ssh -p $SSH_PORT $USERNAME@你的VPS_IP"
 }
 
+# ==== 删除用户 ====
 function delete_user() {
     read -p "请输入要删除的用户名 [默认: aleta]: " DEL_USER
     DEL_USER=${DEL_USER:-aleta}
 
-    read -p "确认删除用户 $DEL_USER 及其所有配置和主目录？ [Y/n]: " confirm
+    read -p "确认删除用户 $DEL_USER 及其所有配置？ [Y/n]: " confirm
     if [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]]; then
         sudo rm -f "/etc/sudoers.d/$DEL_USER"
         sudo userdel -rf "$DEL_USER" || true
@@ -156,6 +153,7 @@ function delete_user() {
     fi
 }
 
+# ==== 主菜单 ====
 function main_menu() {
     while true; do
         echo ""
