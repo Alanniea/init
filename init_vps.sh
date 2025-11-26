@@ -16,60 +16,69 @@ function check_port() {
     fi
 }
 
-# ================= SSH 安全修改（含本地 + 远程测试） =================
+# ================= SSH 安全修改（含 cloud-init 修复 + 本地 + 远程测试） =================
 function safe_modify_ssh_port() {
     local NEWPORT=$1
     local SSHCFG="/etc/ssh/sshd_config"
+    local CLOUDCFG="/etc/ssh/sshd_config.d/50-cloud-init.conf"
     local BACKUP="/etc/ssh/sshd_config.bak_$NEWPORT"
     local REMOTE_IP=$(curl -s https://ipinfo.io/ip)
 
     echo "🔧 正在安全修改 SSH 端口为 $NEWPORT..."
     sudo cp "$SSHCFG" "$BACKUP"
 
+    # ===== 修复 cloud-init 覆盖端口的问题 =====
+    if [ -f "$CLOUDCFG" ]; then
+        if grep -q "^Port " "$CLOUDCFG"; then
+            echo "⚠ 检测到 cloud-init 覆盖端口，已自动注释..."
+            sudo sed -i 's/^Port /#Port /' "$CLOUDCFG"
+        fi
+    fi
+    # ==========================================
+
     # 注释掉所有已有 Port
     sudo sed -i 's/^\s*Port\s\+/##Port /' "$SSHCFG"
 
-    # 添加新端口
+    # 写入新端口
     echo "Port $NEWPORT" | sudo tee -a "$SSHCFG" >/dev/null
 
-    # 防火墙放行新端口
+    # 防火墙放行
     sudo ufw allow "$NEWPORT"/tcp >/dev/null
 
-    # 检查 SSH 配置语法
+    # 检查语法
     if ! sudo sshd -t; then
-        echo "❌ SSH 配置语法错误！回滚..."
+        echo "❌ SSH 配置错误！回滚..."
         sudo mv "$BACKUP" "$SSHCFG"
         sudo systemctl restart ssh
         return 1
     fi
 
-    # 重启 SSH 服务
+    # 重启 SSH
     sudo systemctl restart ssh
     sleep 1
 
     # 本地监听检测
     if ! sudo ss -tlnp | grep -E "(:$NEWPORT|:$NEWPORT\s)" >/dev/null; then
-        echo "❌ SSH 没有在本地监听端口 $NEWPORT"
+        echo "❌ SSH 未在本地监听端口 $NEWPORT"
         sudo mv "$BACKUP" "$SSHCFG"
         sudo systemctl restart ssh
         return 1
     fi
 
-    # 远程公网 IP 测试连接
-    echo "🌐 测试远程连接 $REMOTE_IP:$NEWPORT..."
-    if ! nc -z -w3 $REMOTE_IP $NEWPORT >/dev/null 2>&1; then
-        echo "❌ 无法通过公网 IP 连接 SSH，可能防火墙或安全组限制"
+    # 公网连通性测试
+    echo "🌐 测试公网连接 $REMOTE_IP:$NEWPORT..."
+    if ! nc -z -w3 "$REMOTE_IP" "$NEWPORT" >/dev/null 2>&1; then
+        echo "❌ 公网无法连接 SSH，新端口不可用，回滚中..."
         sudo mv "$BACKUP" "$SSHCFG"
         sudo systemctl restart ssh
-        echo "✔ 已自动回滚到旧端口"
         return 1
     fi
 
     sudo rm -f "$BACKUP"
-    echo "✔ SSH 新端口 $NEWPORT 成功启用，本地 + 公网可连通"
+    echo "✔ SSH 新端口 $NEWPORT 启用成功（cloud-init 已处理）"
     return 0
 }
-# ===============================================================
+# =====================================================================================
 
 function init_vps() {
     echo "🚀 VPS 初始化开始..."
