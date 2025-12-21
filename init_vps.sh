@@ -1,219 +1,111 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-############################
-# VPS 一键初始化脚本（含：创建用户 -> 禁用 root 远程登录）
-# - 创建用户（默认 aleta）
-# - 设置 SSH 端口（默认 21357）
-# - 安装并配置公钥登录（可从常见位置读取或粘贴）
-# - 启用免密 sudo
-# - 安装 fail2ban
-# - 使用 UFW 放行 80/443 和 SSH 端口
-# - 为新用户生成随机密码并显示
-# - 在创建完成后禁用 root 远程登录（PermitRootLogin no）
-############################
+# =================================================================
+# Script Name: Ubuntu VPS One-Click Initialization
+# Description: Setup user, SSH, Sudo, UFW, Fail2ban, and Ports.
+# Author: Gemini
+# =================================================================
 
-# --- helper
-info()  { echo -e "\\e[1;34m[INFO]\\e[0m $*"; }
-warn()  { echo -e "\\e[1;33m[WARN]\\e[0m $*"; }
-error() { echo -e "\\e[1;31m[ERROR]\\e[0m $*"; exit 1; }
+# Color markers for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-# require root
-if [[ $EUID -ne 0 ]]; then
-  error "请以 root 身份运行脚本 (sudo)."
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${RED}Error: Please run this script as root or using sudo.${NC}"
+  exit 1
 fi
 
-read -r -p "用户名 (默认: aleta): " INPUT_USER
-USER_NAME="${INPUT_USER:-aleta}"
+echo -e "${GREEN}=== Ubuntu VPS Initialization Started ===${NC}"
 
-read -r -p "SSH 端口 (默认: 21357): " INPUT_PORT
-SSH_PORT="${INPUT_PORT:-21357}"
+# 1. Configuration Variables (Interactive)
+read -p "Enter new username [default: aleta]: " USERNAME
+USERNAME=${USERNAME:-aleta}
 
-echo
-info "将尝试从以下位置读取公钥（若存在）："
-CANDIDATE_KEYS=()
-orig_user="${SUDO_USER:-}"
-if [[ -n "$orig_user" ]]; then
-  CANDIDATE_KEYS+=("/home/${orig_user}/.ssh/id_rsa.pub")
-  CANDIDATE_KEYS+=("/home/${orig_user}/.ssh/id_ed25519.pub")
-fi
-CANDIDATE_KEYS+=("/root/.ssh/id_rsa.pub" "/root/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub" "$HOME/.ssh/id_ed25519.pub")
+read -p "Enter custom SSH port [default: 21357]: " SSH_PORT
+SSH_PORT=${SSH_PORT:-21357}
 
-for k in "${CANDIDATE_KEYS[@]}"; do
-  echo " - $k"
-done
+# Get Local Public Key
+# Note: Since the script runs on the VPS, we ask the user to paste the content of ~/.ssh/id_rsa.pub
+echo -e "${YELLOW}Please paste the content of your LOCAL ~/.ssh/id_rsa.pub:${NC}"
+read -p "Public Key: " PUBLIC_KEY
 
-read -r -p "如果要从文件读取，输入文件路径并回车；直接回车将尝试上面位置；或粘贴公钥并以 CTRL-D 结束： " KEY_INPUT
-
-PUBKEY=""
-if [[ -n "$KEY_INPUT" ]]; then
-  if [[ -f "$KEY_INPUT" ]]; then
-    PUBKEY="$(<"$KEY_INPUT")"
-  else
-    info "检测为粘贴公钥；读取粘贴内容，结束请按 CTRL-D"
-    pasted="$(cat -)"
-    PUBKEY="$pasted"
-  fi
-else
-  for k in "${CANDIDATE_KEYS[@]}"; do
-    if [[ -f "$k" ]]; then
-      info "从 $k 读取公钥"
-      PUBKEY="$(<"$k")"
-      break
-    fi
-  done
+if [ -z "$PUBLIC_KEY" ]; then
+    echo -e "${RED}Error: Public key is required for secure login.${NC}"
+    exit 1
 fi
 
-if [[ -z "${PUBKEY// /}" ]]; then
-  warn "未检测到公钥内容 —— 将创建用户但不会安装 authorized_keys（你以后可手动添加公钥）。"
-else
-  PUBKEY="$(echo "$PUBKEY" | tr -d '\r\n' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-fi
+# 2. Generate Random Password
+RANDOM_PASS=$(openssl rand -base64 16)
 
-# Confirm
-echo
-info "将创建用户: $USER_NAME"
-info "SSH 将改为端口: $SSH_PORT"
-if [[ -n "$PUBKEY" ]]; then
-  info "将安装提供的公钥到 /home/$USER_NAME/.ssh/authorized_keys"
-else
-  warn "没有提供公钥 — 请在创建后手动添加公钥以免被锁定。"
-fi
+# 3. System Update
+echo -e "${YELLOW}Updating system packages...${NC}"
+apt update && apt upgrade -y
 
-read -r -p "继续执行吗？ (Y/n): " _cont
-_cont="${_cont:-Y}"
-if [[ "$_cont" =~ ^[Nn] ]]; then
-  error "已取消。"
-fi
+# 4. Create User and Setup Sudo
+echo -e "${YELLOW}Creating user: $USERNAME...${NC}"
+useradd -m -s /bin/bash "$USERNAME"
+echo "$USERNAME:$RANDOM_PASS" | chpasswd
+usermod -aG sudo "$USERNAME"
 
-# --- create user if not exists
-if id "$USER_NAME" &>/dev/null; then
-  warn "用户 $USER_NAME 已存在，脚本将更新该用户的设置（公钥、sudo、密码等）。"
-  NEW_CREATED=false
-else
-  info "创建用户 $USER_NAME ..."
-  useradd -m -s /bin/bash -G sudo "$USER_NAME"
-  NEW_CREATED=true
-fi
+# Enable Passwordless Sudo
+echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$USERNAME"
+chmod 0440 "/etc/sudoers.d/$USERNAME"
 
-# --- generate random password for the user
-RANDOM_PASSWORD="$(openssl rand -base64 18 | tr -d '\n' )"
-echo "${USER_NAME}:${RANDOM_PASSWORD}" | chpasswd
+# 5. Setup SSH Directory and Key
+USER_HOME="/home/$USERNAME"
+mkdir -p "$USER_HOME/.ssh"
+echo "$PUBLIC_KEY" > "$USER_HOME/.ssh/authorized_keys"
+chown -R "$USERNAME:$USERNAME" "$USER_HOME/.ssh"
+chmod 700 "$USER_HOME/.ssh"
+chmod 600 "$USER_HOME/.ssh/authorized_keys"
 
-# Create .ssh and authorized_keys if pubkey provided
-if [[ -n "$PUBKEY" ]]; then
-  info "设置 $USER_NAME 的 SSH 公钥..."
-  user_ssh_dir="/home/$USER_NAME/.ssh"
-  mkdir -p "$user_ssh_dir"
-  chmod 700 "$user_ssh_dir"
-  printf "%s\n" "$PUBKEY" > "$user_ssh_dir/authorized_keys"
-  chown -R "$USER_NAME:$USER_NAME" "$user_ssh_dir"
-  chmod 600 "$user_ssh_dir/authorized_keys"
-fi
+# 6. Secure SSH Configuration
+echo -e "${YELLOW}Configuring SSH on port $SSH_PORT...${NC}"
+sed -i "s/^#Port 22/Port $SSH_PORT/" /etc/ssh/sshd_config
+sed -i "s/^#PermitRootLogin.*/PermitRootLogin no/" /etc/ssh/sshd_config
+sed -i "s/^#PasswordAuthentication.*/PasswordAuthentication no/" /etc/ssh/sshd_config
+sed -i "s/^PasswordAuthentication.*/PasswordAuthentication no/" /etc/ssh/sshd_config
+sed -i "s/^#PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
 
-# --- enable passwordless sudo
-info "为 $USER_NAME 配置免密 sudo (/etc/sudoers.d/010-$USER_NAME)..."
-echo "$USER_NAME ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/010-$USER_NAME"
-chmod 440 "/etc/sudoers.d/010-$USER_NAME"
+# 7. Install Fail2ban
+echo -e "${YELLOW}Installing Fail2ban...${NC}"
+apt install -y fail2ban
+cat <<EOF > /etc/fail2ban/jail.local
+[sshd]
+enabled = true
+port = $SSH_PORT
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5
+bantime = 3600
+EOF
+systemctl restart fail2ban
 
-# --- apt update and install packages
-info "更新 apt 索引并安装 fail2ban 和 ufw"
-apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban ufw
-
-# --- configure UFW: allow ports
-info "配置 UFW：允许 SSH($SSH_PORT), 80, 443"
-ufw allow "${SSH_PORT}/tcp"
+# 8. Setup UFW Firewall
+echo -e "${YELLOW}Configuring UFW Firewall...${NC}"
+apt install -y ufw
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow "$SSH_PORT/tcp"
 ufw allow 80/tcp
 ufw allow 443/tcp
+echo "y" | ufw enable
 
-# Enable UFW if not enabled
-ufw_status="$(ufw status | head -n1 || true)"
-if [[ "$ufw_status" == "Status: inactive" ]]; then
-  info "启用 UFW..."
-  ufw --force enable
-else
-  info "UFW 已启用，已添加规则。"
-fi
+# 9. Restart SSH Service
+systemctl restart ssh
 
-# --- configure sshd
-SSHD_CONF="/etc/ssh/sshd_config"
-BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
-info "备份 sshd 配置到 $BACKUP"
-cp -a "$SSHD_CONF" "$BACKUP"
+# 10. Summary and Completion
+echo -e "\n${GREEN}==============================================${NC}"
+echo -e "${GREEN}    Initialization Completed Successfully!    ${NC}"
+echo -e "${GREEN}==============================================${NC}"
+echo -e "${YELLOW}Username:   ${NC} $USERNAME"
+echo -e "${YELLOW}Password:   ${NC} $RANDOM_PASS (Note: Keep this safe for sudo operations)"
+echo -e "${YELLOW}SSH Port:   ${NC} $SSH_PORT"
+echo -e "${YELLOW}SSH Command:${NC} ssh -p $SSH_PORT $USERNAME@$(curl -s ifconfig.me)"
+echo -e "${YELLOW}Firewall:   ${NC} Ports $SSH_PORT, 80, 443 are OPEN."
+echo -e "${GREEN}==============================================${NC}"
+echo -e "${RED}Warning: Make sure you can login with the new user before closing this session!${NC}"
 
-info "更新 $SSHD_CONF：设置 Port $SSH_PORT，确保允许公钥认证并根据情况设置密码认证"
-set_or_replace() {
-  local key="$1"; local val="$2"
-  if grep -qiE "^\\s*#?\\s*${key}\\b" "$SSHD_CONF"; then
-    sed -ri "s|^\\s*#?\\s*${key}\\b.*|${key} ${val}|I" "$SSHD_CONF"
-  else
-    echo "${key} ${val}" >> "$SSHD_CONF"
-  fi
-}
-
-set_or_replace Port "$SSH_PORT"
-set_or_replace PubkeyAuthentication "yes"
-if [[ -n "$PUBKEY" ]]; then
-  set_or_replace PasswordAuthentication "no"
-else
-  warn "没有提供公钥，保留 PasswordAuthentication（避免将你锁死）。"
-  set_or_replace PasswordAuthentication "yes"
-fi
-set_or_replace AuthorizedKeysFile ".ssh/authorized_keys"
-
-# Restart SSH to apply SSH port / auth changes now (before disabling root)
-info "重启 ssh 服务（应用端口与认证更改）"
-if systemctl list-unit-files | grep -qi sshd; then
-  systemctl restart sshd
-else
-  systemctl restart ssh || true
-fi
-
-# --- ensure fail2ban running
-info "确保 fail2ban 正常启动"
-systemctl enable --now fail2ban || true
-
-# --- Now disable root remote login (PermitRootLogin no)
-# We do this AFTER the new user/password/key is in place to avoid锁死 root
-info "将在确认新用户已创建后禁用 root 远程登录 (PermitRootLogin no)"
-set_or_replace PermitRootLogin "no"
-
-# Backup again (optional) and restart ssh to apply PermitRootLogin change
-cp -a "$SSHD_CONF" "${SSHD_CONF}.postuser.bak.$(date +%Y%m%d%H%M%S)" || true
-info "重启 ssh 服务（应用 PermitRootLogin=no）"
-if systemctl list-unit-files | grep -qi sshd; then
-  systemctl restart sshd
-else
-  systemctl restart ssh || true
-fi
-
-# --- summary
-echo
-echo "========================================"
-info "初始化完成（摘要）："
-echo "  用户名:      $USER_NAME"
-echo "  SSH 端口:    $SSH_PORT"
-if [[ -n "$PUBKEY" ]]; then
-  echo "  公钥:        已安装到 /home/$USER_NAME/.ssh/authorized_keys"
-else
-  echo "  公钥:        未安装（请手动添加）"
-fi
-echo "  fail2ban:    已安装并尝试启用"
-echo "  防火墙 (UFW): 已启用并放行 80, 443 和 $SSH_PORT"
-echo "  root 远程登录: 已禁用 (PermitRootLogin no)"
-echo
-echo "  ${USER_NAME} 的随机密码（请保存）："
-echo
-echo "  >>> ${RANDOM_PASSWORD} <<<"
-echo
-primary_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-if [[ -n "$primary_ip" ]]; then
-  echo "连接示例："
-  echo "  ssh -i ~/.ssh/id_rsa -p ${SSH_PORT} ${USER_NAME}@${primary_ip}"
-else
-  echo "请使用你的 VPS IP（或域名）连接： ssh -i ~/.ssh/id_rsa -p ${SSH_PORT} ${USER_NAME}@<your-server-ip>"
-fi
-echo
-warn "重要：已禁用 root 远程登录。确保你能以新用户登录（公钥或上面显示的密码），否则可能无法远程访问。若需恢复 root 登录，可在控制台修改 /etc/ssh/sshd_config 中 PermitRootLogin 的值并重启 ssh。"
-echo "========================================"
