@@ -6,84 +6,74 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-echo "--- Ubuntu VPS 初始化脚本 ---"
+echo "--- Ubuntu VPS 一键初始化脚本 ---"
 
 # 1. 交互式获取参数
-read -p "请输入要创建的用户名 [默认: aleta]: " NEW_USER
-NEW_USER=${NEW_USER:-aleta}
+read -p "请输入要创建的用户名 [默认: aleta]: " USERNAME
+USERNAME=${USERNAME:-aleta}
 
-read -p "请输入 SSH 端口号 [默认: 21357]: " SSH_PORT
+read -p "请输入 SSH 端口 [默认: 21357]: " SSH_PORT
 SSH_PORT=${SSH_PORT:-21357}
 
-# 提示输入公钥
-echo "请粘贴您的本地公钥 (~/.ssh/id_rsa.pub 的内容):"
-read -r SSH_PUB_KEY
-
-if [[ -z "$SSH_PUB_KEY" ]]; then
+read -p "请粘贴您的本地公钥 (id_rsa.pub 的内容): " SSH_KEY
+if [ -z "$SSH_KEY" ]; then
     echo "错误：必须提供 SSH 公钥才能继续。"
     exit 1
 fi
 
 # 2. 生成随机密码
-RANDOM_PASS=$(openssl rand -base64 12)
+PASSWORD=$(openssl rand -base64 12)
 
 # 3. 更新系统
 apt update && apt upgrade -y
 
-# 4. 创建用户并设置
-useradd -m -s /bin/bash "$NEW_USER"
-echo "$NEW_USER:$RANDOM_PASS" | chpasswd
-usermod -aG sudo "$NEW_USER"
+# 4. 创建用户并设置权限
+useradd -m -s /bin/bash "$USERNAME"
+echo "$USERNAME:$PASSWORD" | chpasswd
+usermod -aG sudo "$USERNAME"
 
-# 设置免密 sudo
-echo "$NEW_USER ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$NEW_USER"
+# 5. 配置免密 sudo
+echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$USERNAME"
 
-# 5. 配置 SSH 密钥登录
-USER_HOME="/home/$NEW_USER"
+# 6. 配置 SSH 密钥登录
+USER_HOME=$(eval echo "~$USERNAME")
 mkdir -p "$USER_HOME/.ssh"
-echo "$SSH_PUB_KEY" > "$USER_HOME/.ssh/authorized_keys"
-chown -R "$NEW_USER:$NEW_USER" "$USER_HOME/.ssh"
+echo "$SSH_KEY" > "$USER_HOME/.ssh/authorized_keys"
+chown -R "$USERNAME:$USERNAME" "$USER_HOME/.ssh"
 chmod 700 "$USER_HOME/.ssh"
 chmod 600 "$USER_HOME/.ssh/authorized_keys"
 
-# 6. 修改 SSH 配置
+# 7. 修改 SSH 配置
 sed -i "s/^#\?Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
 sed -i "s/^#\?PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
 sed -i "s/^#\?PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
 systemctl restart ssh
 
-# 7. 安装并配置 Fail2ban
+# 8. 安装 fail2ban
 apt install -y fail2ban
-cat <<EOF > /etc/fail2ban/jail.local
-[sshd]
-enabled = true
-port = $SSH_PORT
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 5
-bantime = 1h
-EOF
-systemctl restart fail2ban
+systemctl enable fail2ban
+systemctl start fail2ban
 
-# 8. 配置 UFW 防火墙
-apt install -y ufw
+# 9. 配置 UFW 防火墙
 ufw allow "$SSH_PORT"/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
 ufw --force enable
 
-# --- 结果输出 ---
+# 10. 输出结果
 clear
 echo "========================================"
-echo "          VPS 初始化完成！"
+echo "          初始化完成！                  "
 echo "========================================"
-echo "用户名     : $NEW_USER"
-echo "随机密码   : $RANDOM_PASS"
-echo "SSH 端口   : $SSH_PORT"
-echo "管理权限   : 已开启免密 sudo"
-echo "防火墙     : 已放行 $SSH_PORT, 80, 443"
-echo "Fail2ban   : 已启动并监控端口 $SSH_PORT"
+echo "用户名: $USERNAME"
+echo "初始密码: $PASSWORD (建议保存，虽然已开启免密sudo)"
+echo "SSH 端口: $SSH_PORT"
+echo "防火墙已放行: $SSH_PORT, 80, 443"
+echo "----------------------------------------"
+echo "请使用以下命令尝试登录:"
+echo "ssh -p $SSH_PORT $USERNAME@$(curl -s ifconfig.me)"
 echo "========================================"
-echo "请使用以下命令连接："
-echo "ssh -p $SSH_PORT $NEW_USER@your_server_ip"
-echo "========================================"
+EOF
+
+chmod +x init.sh
+./init.sh
